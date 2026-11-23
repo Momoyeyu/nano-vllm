@@ -20,7 +20,7 @@ class VocabParallelEmbedding(nn.Module):
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
-        self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
+        self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition  # 当前 rank 负责连续的一段词表
         self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
         self.weight.weight_loader = self.weight_loader
 
@@ -28,17 +28,17 @@ class VocabParallelEmbedding(nn.Module):
         param_data = param.data
         shard_size = param_data.size(0)
         start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)  # 只加载本 rank 负责的词向量
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
         if self.tp_size > 1:
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-            x = mask * (x - self.vocab_start_idx)
+            x = mask * (x - self.vocab_start_idx)  # 全局 token ID 转成本地 ID；不属于本 rank 的输入暂时置零
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
-            y = mask.unsqueeze(1) * y
-            dist.all_reduce(y)
+            y = mask.unsqueeze(1) * y  # 清除其他 rank 为无效 token 产生的 embedding
+            dist.all_reduce(y)  # 每个 token 只在一个 rank 有效，求和后得到完整结果
         return y
 
 
@@ -57,10 +57,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
-        logits = F.linear(x, self.weight)
+            x = x[last_indices].contiguous()  # prefill 只需每条序列最后一个位置的 hidden state 来预测下一个 token
+        logits = F.linear(x, self.weight)  # 每个 rank 先计算自己负责词表区间的 logits
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
-            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None  # rank 0 拼回完整词表供采样器使用
         return logits
