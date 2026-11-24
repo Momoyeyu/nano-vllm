@@ -26,16 +26,10 @@ pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 
 ## 模型下载
 
-如需手动下载模型权重，请使用以下命令（需要 `huggingface_hub` 1.x，该版本提供 `hf` 命令）：
+请使用 Hugging Face CLI（`hf`）下载模型权重：
 ```bash
 hf download Qwen/Qwen3-0.6B \
   --local-dir ~/huggingface/Qwen3-0.6B/
-```
-下载默认支持断点续传。如果你使用的是 `huggingface_hub` 0.x，请改用旧版命令：
-```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
 ```
 
 ## 快速开始
