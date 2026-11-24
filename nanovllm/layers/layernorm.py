@@ -3,6 +3,7 @@ from torch import nn
 
 
 class RMSNorm(nn.Module):
+    """按均方根归一化隐藏状态，不使用 LayerNorm 的均值中心化。"""
 
     def __init__(
         self,
@@ -11,15 +12,23 @@ class RMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size))  # RMSNorm 不减均值，这里只保留逐通道缩放参数
+        self.weight = nn.Parameter(torch.ones(hidden_size))
 
     @torch.compile
     def rms_forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        """计算普通 RMSNorm。
+
+        Args:
+            x: 最后一维为 hidden_size 的输入。
+
+        Returns:
+            torch.Tensor: 与输入形状相同的归一化结果。
+        """
         orig_dtype = x.dtype
-        x = x.float()  # 在 FP32 中计算均方根，降低低精度下的数值误差
+        x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(orig_dtype).mul_(self.weight)
@@ -31,9 +40,14 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """融合残差相加和 RMSNorm。
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: 归一化后的分支输入，以及传给下一层的残差。
+        """
         orig_dtype = x.dtype
-        x = x.float().add_(residual.float())  # 融合残差相加与 RMSNorm，减少一次显存读写
-        residual = x.to(orig_dtype)  # 返回未归一化的残差，供 Transformer 后续继续累加
+        x = x.float().add_(residual.float())
+        residual = x.to(orig_dtype)
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(orig_dtype).mul_(self.weight)
@@ -47,4 +61,4 @@ class RMSNorm(nn.Module):
         if residual is None:
             return self.rms_forward(x)
         else:
-            return self.add_rms_forward(x, residual)  # Decoder 层内部通常走融合版本
+            return self.add_rms_forward(x, residual)

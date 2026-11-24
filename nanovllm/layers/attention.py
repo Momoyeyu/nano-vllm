@@ -18,7 +18,7 @@ def store_kvcache_kernel(
     slot_mapping_ptr,
     D: tl.constexpr,
 ):
-    idx = tl.program_id(0)  # 每个 Triton program 负责写入一个 token 的全部 KV 头
+    idx = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + idx)
     if slot == -1: return  # CUDA Graph 的 padding token 不写缓存
     key_offsets = idx * key_stride + tl.arange(0, D)
@@ -31,16 +31,21 @@ def store_kvcache_kernel(
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
+    """把一个批次每个 token 的 K/V 写入分页缓存。
+
+    输入 K/V 的所有头在最后一维连续存放；slot_mapping 为每个 token 指定扁平缓存槽位。
+    """
     N, num_heads, head_dim = key.shape
-    D = num_heads * head_dim  # 将一个 token 的所有 KV 头视为一段连续向量
+    D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)  # 启动 N 个 GPU program
+    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
 class Attention(nn.Module):
+    """在 prefill/decode 两种模式下写入并读取分页 KV Cache。"""
 
     def __init__(
         self,
@@ -54,22 +59,27 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        self.k_cache = self.v_cache = torch.tensor([])  # allocate_kv_cache 后会替换为当前层缓存的 GPU 视图
+        self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        """执行 attention，并根据 Context 选择 prefill 或 decode kernel。
+
+        prefill 使用 varlen FlashAttention；若存在前缀缓存则通过块表读取历史 KV。
+        decode 的 Query 长度为 1，直接从分页 KV Cache 读取上下文。
+        """
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)  # 先把本轮输入 token 的 K/V 写入分页缓存
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache  # 有已复用前缀时，让 FlashAttention 通过块表读取完整历史 KV
+                k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)  # prefill 支持不同长度和可选前缀缓存
+                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables,
-                                        softmax_scale=self.scale, causal=True)  # decode 的 Query 长度为 1，直接读取分页 KV Cache
+                                        softmax_scale=self.scale, causal=True)
         return o

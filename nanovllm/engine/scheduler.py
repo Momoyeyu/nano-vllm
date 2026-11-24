@@ -6,6 +6,7 @@ from nanovllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
+    """在请求队列、token 预算和 KV Cache 容量之间选择本轮工作。"""
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
@@ -23,49 +24,54 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        """选择本轮交给模型的序列，并标记执行阶段。
+        """选择本轮要执行的序列，并返回执行阶段。
 
-        调度器优先处理 waiting 队列中的 prefill，再处理 running 队列中的 decode；
-        prefill 受序列数和 token 预算限制，长请求可以通过 chunked prefill 分段推进。
-        decode 每个序列每轮推进一个 token，KV Cache 不足时通过抢占其他序列释放物理块。
-        返回 (本轮序列列表, is_prefill)，供 ModelRunner 选择对应的前向路径。
+        调度遵循以下原则：
+        1. waiting 队列中的 prefill 优先于 running 队列中的 decode。
+        2. prefill 同时受最大序列数和 token 预算限制；必要时只对本轮首个请求做
+           chunked prefill，保证长 prompt 也能持续推进。
+        3. 没有 prefill 时，每个 running 序列每轮 decode 一个 token；若 KV Cache
+           不足，则先抢占其他序列释放物理块。
+
+        Returns:
+            tuple[list[Sequence], bool]: 本轮序列列表和是否为 prefill 阶段。
         """
         scheduled_seqs = []
         num_batched_tokens = 0
 
-        # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:  # 依次尝试把等待请求装入本轮 prefill 批次
-            seq = self.waiting[0]  # 始终先看队首，保持 FIFO，并优先完成被拆分的请求
+        # Prefill
+        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+            seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:  # 本轮 prefill 的 token 预算已用完
+            if remaining == 0:
                 break
-            if not seq.block_table:  # 新请求或被抢占的请求还没有块表，先检查前缀缓存和 KV Cache 容量
+            if not seq.block_table:  # 新请求或被抢占请求先检查缓存和容量
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:  # 空闲 KV Cache 块不足，队首请求暂时无法调度
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # 只有本轮首个请求允许 chunked prefill，后续请求放不下就等下轮
+            if remaining < num_tokens and scheduled_seqs:  # 只有本轮首个请求允许 chunked prefill
                 break
-            if not seq.block_table:  # 正式分配物理块，并复用已经命中的前缀缓存块
+            if not seq.block_table:  # 正式建立块表并复用命中的前缀缓存
                 self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)  # 装得下就全调度，否则只调度剩余预算对应的一段
+            seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:  # 本轮覆盖全部待 prefill token，可移入 running 队列
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
 
-        if scheduled_seqs:  # 本轮有 prefill 就优先执行，不再混入 decode
+        if scheduled_seqs:
             return scheduled_seqs, True
 
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:  # 没有 prefill 时，尽量让所有运行序列各生成一个 token
+        # Decode
+        while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):  # 新 token 需要新块但显存不足时，持续抢占直到腾出空间
-                if self.running:  # 还有其他运行请求时，抢占队尾请求来释放 KV Cache 块
+            while not self.block_manager.can_append(seq):  # 新 token 需要新块但显存不足
+                if self.running:
                     self.preempt(self.running.pop())
                 else:
                     self.preempt(seq)
@@ -75,25 +81,44 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs  # 简化实现假定抢占后本轮仍有可调度的 decode 序列
-        self.running.extendleft(reversed(scheduled_seqs))  # 恢复刚才从队首弹出后的原有顺序
+        assert scheduled_seqs
+        self.running.extendleft(reversed(scheduled_seqs))  # 恢复从队首弹出前的顺序
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
+        """暂停一个序列并释放其 KV Cache，让其他序列获得显存。
+
+        Args:
+            seq: 要暂停的运行序列；其 token 历史会继续保留。
+
+        Notes:
+            重新调度时会走 prefill，但完整前缀仍可能命中缓存。
+        """
         seq.status = SequenceStatus.WAITING
-        seq.is_prefill = True  # 块释放后需要重新走 prefill 调度，但仍可能命中前缀缓存
+        seq.is_prefill = True
         self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)  # 被抢占的请求放到等待队列最前面，之后优先恢复
+        self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
-        for seq, token_id in zip(seqs, token_ids):  # 每个调度序列对应采样器返回的一个 token
-            self.block_manager.hash_blocks(seq)  # 将本轮新算完整的 KV 块登记到前缀缓存索引
-            seq.num_cached_tokens += seq.num_scheduled_tokens  # 标记本轮 token 的 KV Cache 已计算完成
+        """消费采样结果并推进序列状态。
+
+        Args:
+            seqs: 本轮执行过的序列。
+            token_ids: 与 seqs 一一对应的采样结果。
+            is_prefill: 本轮是否执行 prefill。
+
+        Notes:
+            对未完成的 chunked prefill 只更新 KV Cache 进度，不追加中间位置的采样 token；
+            prefill 完成或 decode 得到 token 后，再检查 EOS 和 max_tokens。
+        """
+        for seq, token_id in zip(seqs, token_ids):
+            self.block_manager.hash_blocks(seq)
+            seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
-                continue  # chunked prefill 尚未到 prompt 末尾，本轮采样结果没有意义，不追加
+                continue
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)  # 请求结束后立即归还物理块供其他请求使用
+                self.block_manager.deallocate(seq)
                 self.running.remove(seq)

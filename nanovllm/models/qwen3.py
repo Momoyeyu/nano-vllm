@@ -12,6 +12,7 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 class Qwen3Attention(nn.Module):
+    """Qwen3 的张量并行多头注意力模块。"""
 
     def __init__(
         self,
@@ -29,14 +30,14 @@ class Qwen3Attention(nn.Module):
         tp_size = dist.get_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size  # 每张 GPU 只计算一部分 Q 头
+        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
         assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size  # GQA 中 K/V 头数通常少于 Q 头数
+        self.num_kv_heads = self.total_num_kv_heads // tp_size
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5  # softmax(QK^T / sqrt(head_dim)) 中的缩放因子
+        self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
 
         self.qkv_proj = QKVParallelLinear(
@@ -45,7 +46,7 @@ class Qwen3Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
-        )  # 一次矩阵乘法同时生成 Q、K、V
+        )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -67,16 +68,17 @@ class Qwen3Attention(nn.Module):
         )
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)  # Qwen3 在无 QKV bias 配置下对 Q/K 做逐头归一化
+            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        """生成 Q/K/V，应用 RoPE 和 KV Cache attention，再投影回隐藏维度。"""
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.view(-1, self.num_heads, self.head_dim)  # [token 数, Q 头数, head_dim]
+        q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         if not self.qkv_bias:
@@ -84,11 +86,12 @@ class Qwen3Attention(nn.Module):
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
-        output = self.o_proj(o.flatten(1, -1))  # 合并所有 Q 头后投影回 hidden_size
+        output = self.o_proj(o.flatten(1, -1))
         return output
 
 
 class Qwen3MLP(nn.Module):
+    """Qwen3 的 SwiGLU 前馈网络。"""
 
     def __init__(
         self,
@@ -101,7 +104,7 @@ class Qwen3MLP(nn.Module):
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-        )  # 合并 gate_proj 和 up_proj，提高矩阵乘法效率
+        )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -118,6 +121,7 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
+    """一个 Qwen3 decoder block，串联 Attention、残差归一化和 MLP。"""
 
     def __init__(
         self,
@@ -149,10 +153,11 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """执行一个 decoder block，并返回分支输出与新的残差。"""
         if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states  # 首层保存原始 embedding 作为残差
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)  # 先加残差，再归一化出 Attention 输入
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -160,6 +165,7 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
+    """Qwen3 的 embedding、decoder layers 和最终 RMSNorm。"""
 
     def __init__(
         self,
@@ -175,17 +181,20 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        """把 token ID 映射为 hidden states，并依次通过所有 decoder layers。"""
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)  # 最后一层完成残差累加与最终归一化
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
 class Qwen3ForCausalLM(nn.Module):
+    """带张量并行 LM head 的 Qwen3 causal language model。"""
+
     packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),  # 加载器将 Hugging Face 分离的 Q/K/V 权重装入本地合并参数
+        "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
@@ -200,7 +209,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data  # 输入 embedding 与输出词表共享同一份权重
+            self.lm_head.weight.data = self.model.embed_tokens.weight.data  # 输入 embedding 与输出词表共享权重
 
     def forward(
         self,
@@ -213,4 +222,5 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.lm_head(hidden_states)  # ParallelLMHead 会在 prefill 时自动选取每条序列的最后一个位置
+        """把 hidden states 投影到词表空间；LM head 会处理 prefill 的最后位置选择。"""
+        return self.lm_head(hidden_states)

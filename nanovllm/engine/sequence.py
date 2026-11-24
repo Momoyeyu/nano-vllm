@@ -6,29 +6,36 @@ from nanovllm.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
-    WAITING = auto()  # 等待 prefill，或 decode 时因显存不足被抢占
-    RUNNING = auto()  # 已完成 prefill，可以逐 token decode
+    WAITING = auto()   # 等待 prefill，或 decode 时因显存不足被抢占
+    RUNNING = auto()   # 已完成 prefill，可以逐 token decode
     FINISHED = auto()  # 已生成 EOS 或达到 max_tokens
 
 
 class Sequence:
+    """一条生成请求在推理引擎中的可变状态。
+
+    token_ids 同时保存 prompt 和已经生成的 completion；block_table 则记录
+    这些 token 对应的物理 KV Cache 块。调度器和 ModelRunner 通过这些字段
+    协作决定本轮计算范围。
+    """
+
     block_size = 256  # 由 Config 在引擎启动时统一覆盖
-    counter = count()  # 为每个请求分配单调递增的 ID
+    counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
-        self.seq_id = next(Sequence.counter)
-        self.status = SequenceStatus.WAITING
-        self.token_ids = copy(token_ids)  # 同时保存 prompt 和之后生成的 token
-        self.last_token = token_ids[-1]  # decode 时每轮只把最后一个 token 送入模型
-        self.num_tokens = len(self.token_ids)
-        self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0  # 已有可用 KV Cache 的 token 数，包含复用和本轮计算完成的部分
-        self.num_scheduled_tokens = 0  # 当前这一轮准备交给模型计算的 token 数
-        self.is_prefill = True  # 新请求从 prefill 开始，抢占后也会重新 prefill
-        self.block_table = []  # 逻辑 token 块到物理 KV Cache 块 ID 的映射
-        self.temperature = sampling_params.temperature
-        self.max_tokens = sampling_params.max_tokens
-        self.ignore_eos = sampling_params.ignore_eos
+        self.seq_id               = next(Sequence.counter)
+        self.status               = SequenceStatus.WAITING
+        self.token_ids            = copy(token_ids)   # prompt 与 completion 的完整 token 历史
+        self.last_token           = token_ids[-1]     # decode 每轮送入模型的 token
+        self.num_tokens           = len(self.token_ids)
+        self.num_prompt_tokens    = len(token_ids)
+        self.num_cached_tokens    = 0                 # 已有可用 KV Cache 的 token 数
+        self.num_scheduled_tokens = 0                 # 本轮准备交给模型计算的 token 数
+        self.is_prefill           = True              # 新请求或抢占后从 prefill 阶段开始
+        self.block_table          = []                # 逻辑 token 块到物理块 ID 的映射
+        self.temperature          = sampling_params.temperature
+        self.max_tokens           = sampling_params.max_tokens
+        self.ignore_eos           = sampling_params.ignore_eos
 
     def __len__(self):
         return self.num_tokens
@@ -54,7 +61,7 @@ class Sequence:
 
     @property
     def num_blocks(self):
-        return (self.num_tokens + self.block_size - 1) // self.block_size  # 向上取整得到所需逻辑块数
+        return (self.num_tokens + self.block_size - 1) // self.block_size  # 向上取整得到逻辑块数
 
     @property
     def last_block_num_tokens(self):
@@ -62,7 +69,7 @@ class Sequence:
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
-        return self.token_ids[i*self.block_size: (i+1)*self.block_size]  # 取出第 i 个逻辑块包含的 token
+        return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
@@ -70,14 +77,20 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        last_state = self.last_token if not self.is_prefill else self.token_ids  # 跨进程序列化时，prefill 需要完整 token，decode 只需最后 token
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)  # 只发送其他 GPU 进程恢复调度状态所需的数据
+        """构造张量并行 worker 所需的最小可序列化状态。
+
+        Returns:
+            tuple: 调度元数据、块表，以及 prefill 所需的完整 token 或 decode 所需的最后 token。
+        """
+        last_state = self.last_token if not self.is_prefill else self.token_ids
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
 
     def __setstate__(self, state):
+        """恢复由 __getstate__ 生成的跨进程状态。"""
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
-        if isinstance(last_state, list):  # prefill 进程收到完整 token 列表
+        if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
-        else:  # decode 进程只需要最后一个输入 token，不必复制整个历史
+        else:
             self.token_ids = []
             self.last_token = last_state

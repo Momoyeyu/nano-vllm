@@ -7,6 +7,7 @@ from nanovllm.utils.context import get_context
 
 
 class VocabParallelEmbedding(nn.Module):
+    """按词表区间切分 embedding，并通过 all-reduce 还原跨 rank 结果。"""
 
     def __init__(
         self,
@@ -20,7 +21,7 @@ class VocabParallelEmbedding(nn.Module):
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
-        self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition  # 当前 rank 负责连续的一段词表
+        self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
         self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
         self.weight.weight_loader = self.weight_loader
 
@@ -28,21 +29,23 @@ class VocabParallelEmbedding(nn.Module):
         param_data = param.data
         shard_size = param_data.size(0)
         start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)  # 只加载本 rank 负责的词向量
+        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
+        """查找当前 rank 的 token embedding，并汇总其他 rank 的分片结果。"""
         if self.tp_size > 1:
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-            x = mask * (x - self.vocab_start_idx)  # 全局 token ID 转成本地 ID；不属于本 rank 的输入暂时置零
+            x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
-            y = mask.unsqueeze(1) * y  # 清除其他 rank 为无效 token 产生的 embedding
-            dist.all_reduce(y)  # 每个 token 只在一个 rank 有效，求和后得到完整结果
+            y = mask.unsqueeze(1) * y
+            dist.all_reduce(y)
         return y
 
 
 class ParallelLMHead(VocabParallelEmbedding):
+    """张量并行的输出词表投影；rank 0 最终拼接完整 logits。"""
 
     def __init__(
         self,
@@ -54,13 +57,18 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
+        """计算输出 logits。
+
+        prefill 时只保留每条序列最后一个位置的 hidden state；张量并行时，rank 0
+        收集各词表分片后交给采样器。
+        """
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()  # prefill 只需每条序列最后一个位置的 hidden state 来预测下一个 token
-        logits = F.linear(x, self.weight)  # 每个 rank 先计算自己负责词表区间的 logits
+            x = x[last_indices].contiguous()
+        logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
-            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None  # rank 0 拼回完整词表供采样器使用
+            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
