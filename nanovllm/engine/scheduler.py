@@ -23,6 +23,13 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        """选择本轮交给模型的序列，并标记执行阶段。
+
+        调度器优先处理 waiting 队列中的 prefill，再处理 running 队列中的 decode；
+        prefill 受序列数和 token 预算限制，长请求可以通过 chunked prefill 分段推进。
+        decode 每个序列每轮推进一个 token，KV Cache 不足时通过抢占其他序列释放物理块。
+        返回 (本轮序列列表, is_prefill)，供 ModelRunner 选择对应的前向路径。
+        """
         scheduled_seqs = []
         num_batched_tokens = 0
 
